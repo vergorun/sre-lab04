@@ -254,12 +254,97 @@ blade create cpu fullload --cpu-percent 100
 ## 4. Тестирование систем мониторинга и оповещения
 *С помощью chaos engineering можно также проверить, насколько эффективны системы мониторинга и оповещения. Например, можно искусственно вызвать отказ, который должен быть зарегистрирован системой мониторинга, и убедиться, что оповещения доставляются вовремя*
 
-### 4.1. Описание эксперимента:
-### 4.2. Ожидаемые результаты:  
-### 4.3. Реальные результаты:  
-### 4.4. Анализ результатов:
-
-
+Проверка работы алертинга совместно со сценариями:
 1. ”Split-brain": Одновременно изолировать несколько узлов от сети и дать им возможность объявить себя новыми мастер-узлами. Проверить, успеет ли Patroni достичь консенсуса и избежать ситуации "split-brain".
 2. Долгосрочная изоляция: Оставить узел изолированным от кластера на длительное время, затем восстановить соединение и наблюдать за процессом синхронизации и восстановления реплики.
 3. Сбои сервисов зависимостей: Изучить поведение кластера Patroni при сбоях в сопутствующих сервисах, например, etcd (которые используются для хранения состояния кластера), путем имитации его недоступности или некорректной работы.
+
+### 4.1. Описание эксперимента:
+1. Обязательно проверяем что конфиги предыдущих экспериментов деактивированы, при необходимости чистим
+
+```
+blade status --type create
+blade destroy
+```
+2. проверяем статус репикации, проверяем состояние patroni на db1, db2
+```
+patronictl -c /etc/patroni/patroni.yml list
+```
+3. db2 (replica), нарушаем связность с мастером db1 и с 2мя из 3х узлов etcd
+```
+blade create network corrupt --percent 100 --destination-ip 10.0.10.2,10.0.10.4,10.0.10.5 --interface ens160
+```
+4. проверяем, что связности дествительно нет
+db2:
+```
+ping -c 4 -t 5 10.0.10.2
+ping -c 4 -t 5 10.0.10.4
+ping -c 4 -t 5 10.0.10.5
+```
+5. проверяем статус репикации
+db1 (master)
+```
+sudo -u postgres psql weather -c 'select status,last_msg_send_time,last_msg_receipt_time,slot_name,sender_host,sender_port from pg_stat_wal_receiver;'
+```
+db2 (replica):
+```
+sudo -u postgres psql weather -c 'select client_addr, client_hostname, client_port, state, sync_state, reply_time from pg_stat_replication;'
+```
+6. проверяем состояние patroni на db1, db2
+```
+patronictl -c /etc/patroni/patroni.yml list
+```
+7. проверяем значения ключей в etcd
+```
+etcdctl get --prefix /
+```
+8. Пробуем полностью изолировать db2 от db1 и etcd
+db2:
+```
+blade create network corrupt --percent 100 --destination-ip 10.0.10.2,10.0.10.4,10.0.10.5,10.0.10.6 --interface ens160
+```
+проверяем patroni аналогично п.6, общий статус кластера
+```
+sudo -u postgres psql weather -c 'select pg_is_in_recovery()'
+```
+9. Возвращаем связность между db2 и остальными компанентами и проверяем состояние репликации
+
+
+### 4.2. Ожидаемые результаты:  
+После шагов 1-7 ожидаемое поведение: репликация нарушена, но реплика не объявила себя мастером, т.к. patroni на db2 продолжает иметь связность с etcd3, который является частью все еще активного кластера, в котором установлен консенсус (между экземплярами etcd, и между etcd и db1 связность не нарушена). 
+На шаге 8 после полной изоляции patroni от etcd кластера - ожидаем, что останется последнее состояние на db1 - master, на db2 отставшая реплика. 
+### 4.3. Реальные результаты:
+2. До нарушения связности
+db1:<br>
+![split-before-start-db1-patroni](https://github.com/vergorun/sre-lab04/assets/36616396/d527de2a-876c-455e-81fe-3ab0bdf6f980)
+db2:<br>
+![split-before-start-db2-patroni](https://github.com/vergorun/sre-lab04/assets/36616396/d47a570c-68f9-4597-8181-edfedc121072)
+4. Связность нарушена<br>
+![split-db2-lost-connectivity-to-db1_etcd1_etcd2](https://github.com/vergorun/sre-lab04/assets/36616396/2e29eed8-276a-4168-b122-189252392a49)
+5. Репликация остановлена<br>
+![split-replication-lost-db1](https://github.com/vergorun/sre-lab04/assets/36616396/dee0b9c7-0a53-405e-ac67-123c32e28874)
+![split-replication-lost-db2](https://github.com/vergorun/sre-lab04/assets/36616396/aac5a193-9162-4487-96f6-b13f824b94cd)
+6. Вывод patroni подвержает, что репликация остановлена, но у реплики по-прежнему роль реплики<br>
+![split-patront-replication-stop-db1](https://github.com/vergorun/sre-lab04/assets/36616396/e969688f-52fe-443c-a0b2-351732e08cb4)
+![split-patroni-replication-stop-db2](https://github.com/vergorun/sre-lab04/assets/36616396/27079504-eeb7-435f-bab0-d54332d755a8)
+7. Ключи в etcd<br>
+![split-etcd1-keys](https://github.com/vergorun/sre-lab04/assets/36616396/c41a8ac1-0976-431a-b9fc-520d88f9a2bc)
+8. После полной потери связности от db2 до db1 и всех экземпляров etcd<br>
+Patroni потерял связность с DCS и перешел в бесконечный цикл поиска<br>
+![split-db2-connection-lost](https://github.com/vergorun/sre-lab04/assets/36616396/a95ebdf8-3a27-433b-a34e-65a8ca452af2)
+db1 остался единственным мастером, связь с репликой полностью потеряна <br>
+![split-db1-replica-lost](https://github.com/vergorun/sre-lab04/assets/36616396/90fd999f-db3a-4ead-82c3-2de6bec1961d)
+db2 как реплика находится в recovery, но так и не перешла в состояние master<br>
+![split-db2-replica-recovery](https://github.com/vergorun/sre-lab04/assets/36616396/cc3ff909-4be8-49c0-8083-c8d8f8c68726)
+
+9. После восстановления связности реплика успешно синхронизровалась<br>
+![split-db1-resync](https://github.com/vergorun/sre-lab04/assets/36616396/cc67f9d0-c967-44c8-8b41-ef42d3ca13a8)
+![split-db2-resync](https://github.com/vergorun/sre-lab04/assets/36616396/b86680d8-442f-47fc-8e71-62ae6dd4f272)
+
+### 4.4. Анализ результатов:
+Нарушение связности между инстансом базы данных и DCS (etcd) привело к ожидаемым последствиям - при наружешении связности межу инстансами DB нарушается и репликация, но роли конролируются консенсусом DCS, в рассмотренном сценарии реплика продолжает существовать в составе кластера пока есть связность хотя бы с одним экземпляром etcd, а при полной потере связности остается изолированной, но не объявляет себя мастером, а ожидает появления связности с DCS для получения информации о назначенной роли. При восстановлении связности с кластером такая реплика автоматически включается обратно в состав кластера.
+
+При потере связности до 1го из 3х экземпляров etcd нарушения работы также не происходит, т.к. для формирования консенсуса достаточно 2х из 3х экземпляров
+![split-etcd-alert](https://github.com/vergorun/sre-lab04/assets/36616396/9c076f4d-e975-4efe-8c54-37dcecefb3fb)
+
+
